@@ -18,3 +18,7 @@ This builds the app, installs it in `/Applications` and starts it. Click the gea
 - Calendar events come from the macOS Calendar app.
 - Badges and "keep windows above the dock" need the Accessibility permission.
 - Temperature uses private IOKit calls, so it may break on a future macOS.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
