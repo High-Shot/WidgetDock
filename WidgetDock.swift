@@ -256,6 +256,7 @@ final class DockStore: ObservableObject {
         badges = ["/System/Applications/Mail.app": "3", "/System/Applications/Messages.app": "1"]
         todos = [Todo(title: "Ship it"), Todo(title: "Water the plants")]
         locCity = "San Francisco"
+        weatherAt = Date()
         weather = Weather(temp: fahrenheit ? 68 : 20, high: fahrenheit ? 72 : 22, low: fahrenheit ? 55 : 13, code: 1, isDay: true)
         nextEvent = NextEvent(title: "Team standup", start: Date().addingTimeInterval(12 * 60 + 30),
                               end: Date().addingTimeInterval(42 * 60), joinURL: URL(string: "https://meet.google.com/demo"))
@@ -356,6 +357,11 @@ final class DockStore: ObservableObject {
     @Published var runningExtra: [String] = []
     @Published var nextEvent: NextEvent?
     @Published var calendarDenied = false
+    private var watchdogStarted = false
+    /// When the weather last loaded, and why it could not if it didn't.
+    @Published var weatherAt: Date?
+    @Published var weatherNote: String?
+    var weatherStale: Bool { weather != nil && Date().timeIntervalSince(weatherAt ?? .distantPast) > 45 * 60 }
 
     private var prevTicks: (UInt32, UInt32, UInt32, UInt32)?
     private let scriptQueue = DispatchQueue(label: "widgetdock.music")
@@ -420,6 +426,12 @@ final class DockStore: ObservableObject {
         timers.append(Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.tick() })
         timers.append(Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refreshEvents() })
         timers.append(Timer.scheduledTimer(withTimeInterval: 900, repeats: true) { [weak self] _ in self?.refreshWeather() })
+        // Timers pause while the Mac sleeps, so catch up as soon as it wakes.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshWeather()
+            self?.refreshEvents()
+            self?.refreshUsage()
+        }
         refreshUsage()
         timers.append(Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in self?.refreshUsage() })
     }
@@ -706,10 +718,11 @@ final class DockStore: ObservableObject {
         let dock = UserDefaults(suiteName: "com.apple.dock")
         let alreadyHidden = (dock?.double(forKey: "autohide-delay") ?? 0) >= 1000 && (dock?.bool(forKey: "autohide") ?? false)
         if hidden {
-            guard !alreadyHidden else { return }
+            guard !alreadyHidden else { startDockWatchdog(); return }
             if d.object(forKey: "prevAutohide") == nil { d.set(dock?.bool(forKey: "autohide") ?? false, forKey: "prevAutohide") }
             run("/usr/bin/defaults", ["write", "com.apple.dock", "autohide", "-bool", "true"])
             run("/usr/bin/defaults", ["write", "com.apple.dock", "autohide-delay", "-float", "1000"])
+            startDockWatchdog()
         } else {
             guard d.object(forKey: "prevAutohide") != nil || alreadyHidden else { return }
             let prev = d.bool(forKey: "prevAutohide")
@@ -718,6 +731,32 @@ final class DockStore: ObservableObject {
             d.removeObject(forKey: "prevAutohide")
         }
         run("/usr/bin/killall", ["Dock"])
+    }
+
+    /// A small shell script that outlives the app. If WidgetDock dies without quitting cleanly (a crash or a
+    /// force quit) and does not come back within 10 seconds, it brings Apple's Dock back, so the Mac is never
+    /// left without a Dock. A restart during an update comes back in time and is left alone.
+    private func startDockWatchdog() {
+        guard !watchdogStarted else { return }
+        watchdogStarted = true
+        let prev = d.bool(forKey: "prevAutohide") ? "true" : "false"
+        let script = """
+        while kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do sleep 2; done
+        sleep 10
+        pgrep -x WidgetDock >/dev/null && exit 0
+        case "$(defaults read com.apple.dock autohide-delay 2>/dev/null)" in 1000*) ;; *) exit 0 ;; esac
+        defaults write com.apple.dock autohide -bool \(prev)
+        defaults delete com.apple.dock autohide-delay
+        defaults delete local.widgetdock prevAutohide
+        killall Dock
+        """
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", script]
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
     }
 
     func restoreSystemDockOnQuit() {
@@ -867,7 +906,17 @@ final class DockStore: ObservableObject {
     }
 
     func refreshEvents() {
-        guard calendarStarted, EKEventStore.authorizationStatus(for: .event) == .fullAccess else { return }
+        guard calendarStarted else { return }
+        let status = EKEventStore.authorizationStatus(for: .event)
+        guard status == .fullAccess else {
+            // Access was turned off after launch: say so instead of leaving the last event on screen.
+            if status != .notDetermined {
+                if nextEvent != nil { nextEvent = nil }
+                if !calendarDenied { calendarDenied = true }
+            }
+            return
+        }
+        if calendarDenied { calendarDenied = false }
         let now = Date()
         let pred = events.predicateForEvents(withStart: now.addingTimeInterval(-12 * 3600), end: now.addingTimeInterval(7 * 86400), calendars: nil)
         let upcoming = events.events(matching: pred)
@@ -934,7 +983,7 @@ final class DockStore: ObservableObject {
                     geo.queryItems = [.init(name: "name", value: city), .init(name: "count", value: "1")]
                     let (gData, _) = try await URLSession.shared.data(from: geo.url!)
                     guard let place = try JSONDecoder().decode(Geo.self, from: gData).results?.first else {
-                        await MainActor.run { self.weather = nil }
+                        await MainActor.run { self.weather = nil; self.weatherNote = "City not found" }
                         return
                     }
                     latitude = place.latitude
@@ -957,9 +1006,10 @@ final class DockStore: ObservableObject {
                                 low: f.daily.temperature_2m_min.first ?? f.current.temperature_2m,
                                 code: f.current.weather_code,
                                 isDay: f.current.is_day == 1)
-                await MainActor.run { self.weather = w }
+                await MainActor.run { self.weather = w; self.weatherAt = Date(); self.weatherNote = nil }
             } catch {
-                // Keep the last reading when offline.
+                // Keep the last reading when offline; the tile marks it as old after 45 minutes.
+                await MainActor.run { self.weatherNote = "Can't reach the weather service" }
             }
         }
     }
@@ -1020,7 +1070,8 @@ struct WeatherTile: View {
                 VStack(alignment: .leading, spacing: 0) {
                     Text(store.weather.map { "\(Int($0.temp.rounded()))°" } ?? "--°")
                         .font(.system(size: 20 * store.scale, weight: .semibold, design: .rounded))
-                    Text(store.weather.map { "\(store.placeName) · \(Int($0.high.rounded()))° / \(Int($0.low.rounded()))°" } ?? store.placeName)
+                        .opacity(store.weatherStale ? 0.5 : 1)
+                    Text(subtitle)
                         .font(.system(size: 10 * store.scale, weight: .medium))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -1028,7 +1079,17 @@ struct WeatherTile: View {
                 .fixedSize()
             }
         }
-        .help("Weather for \(store.placeName)")
+        .help(store.weatherNote.map { "Weather for \(store.placeName): \($0)" } ?? "Weather for \(store.placeName)")
+    }
+
+    /// Says so when the reading is old or missing, instead of showing old numbers as if they were current.
+    private var subtitle: String {
+        guard let w = store.weather else { return store.weatherNote ?? store.placeName }
+        if store.weatherStale, let at = store.weatherAt {
+            let mins = Int(Date().timeIntervalSince(at) / 60)
+            return "\(store.placeName) · \(mins < 120 ? "\(mins) min" : "\(mins / 60) hr") old"
+        }
+        return "\(store.placeName) · \(Int(w.high.rounded()))° / \(Int(w.low.rounded()))°"
     }
 }
 
