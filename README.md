@@ -1,5 +1,7 @@
 # WidgetDock
 
+![WidgetDock with clock, weather, next event, apps, system stats, now playing and todos](docs/screenshot.png)
+
 A second Dock for macOS with live widgets: clock, weather, next calendar event, apps and folders, system stats (CPU, memory, temperature, battery), now playing, todos and trash. It can replace the system Dock.
 
 ## Install

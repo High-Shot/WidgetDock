@@ -203,8 +203,29 @@ final class Locator: NSObject, CLLocationManagerDelegate {
 // MARK: - Store
 
 final class DockStore: ObservableObject {
+    /// Demo mode renders a sample dock to an image (see `--screenshot`); it never touches real settings.
+    static var demo = false
     static let shared = DockStore()
-    private let d = UserDefaults.standard
+    private let d: UserDefaults = DockStore.demo ? (UserDefaults(suiteName: "local.widgetdock.demo") ?? .standard) : .standard
+
+    func loadDemo() {
+        let apps = [
+            "/System/Library/CoreServices/Finder.app", "/Applications/Safari.app", "/System/Applications/Mail.app",
+            "/System/Applications/Messages.app", "/System/Applications/Calendar.app", "/System/Applications/Notes.app",
+            "/System/Applications/Music.app", "/System/Applications/Photos.app", "/System/Applications/System Settings.app",
+        ].filter { FileManager.default.fileExists(atPath: $0) }
+        items = apps.map { .app($0) }
+        running = Set(apps.prefix(2) + apps.dropFirst(6).prefix(1))
+        badges = ["/System/Applications/Mail.app": "3", "/System/Applications/Messages.app": "1"]
+        todos = [Todo(title: "Ship it"), Todo(title: "Water the plants")]
+        locCity = "San Francisco"
+        weather = Weather(temp: fahrenheit ? 68 : 20, high: fahrenheit ? 72 : 22, low: fahrenheit ? 55 : 13, code: 1, isDay: true)
+        nextEvent = NextEvent(title: "Team standup", start: Date().addingTimeInterval(12 * 60 + 30),
+                              end: Date().addingTimeInterval(42 * 60), joinURL: URL(string: "https://meet.google.com/demo"))
+        cpu = 0.14; mem = 0.62; cpuTemp = 41; battery = 0.86
+        track = Track(title: "Midnight Drive", artist: "Example Artist", playing: true, playerID: "demo", artURL: nil)
+        UserDefaults.standard.removePersistentDomain(forName: "local.widgetdock.demo")
+    }
 
     // Saved settings
     @Published var items: [DockItem] {
@@ -692,6 +713,7 @@ final class DockStore: ObservableObject {
     }
 
     func refreshWeather() {
+        guard !DockStore.demo else { return }
         if autoLocation {
             locator.request()
             if let c = lastCoord { fetchWeather(lat: c.0, lon: c.1) }
@@ -1221,8 +1243,13 @@ struct DockView: View {
     }
 
     var body: some View {
+        // Menus and drag-and-drop can't be drawn off screen, so the sample image leaves them off.
+        if DockStore.demo { bar } else { interactiveBar }
+    }
+
+    private var bar: some View {
         let radius = 24 * store.scale
-        HStack(spacing: 8 * store.scale) {
+        return HStack(spacing: 8 * store.scale) {
             ForEach(store.visibleTiles, id: \.self) { tile($0) }
             Button { (NSApp.delegate as? AppDelegate)?.openSettings() } label: {
                 Image(systemName: "gearshape.fill")
@@ -1235,11 +1262,22 @@ struct DockView: View {
             .help("WidgetDock Settings")
         }
         .padding(10 * store.scale)
-        .background(VisualEffect().opacity(store.opacity).clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous)))
+        .background {
+            if DockStore.demo {
+                // The blur can't be drawn off screen, so the sample image uses a flat tint.
+                RoundedRectangle(cornerRadius: radius, style: .continuous).fill(Color(white: 0.13).opacity(0.82))
+            } else {
+                VisualEffect().opacity(store.opacity).clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            }
+        }
         .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(Color.white.opacity(0.18 * store.opacity), lineWidth: 1))
         .shadow(color: .black.opacity(0.3 * store.opacity), radius: 12, y: 5)
         .padding(20)
         .fixedSize()
+    }
+
+    private var interactiveBar: some View {
+        bar
         .contextMenu {
             Button("WidgetDock Settings…") { (NSApp.delegate as? AppDelegate)?.openSettings() }
             Button("Add App…") { (NSApp.delegate as? AppDelegate)?.addApp() }
@@ -1519,7 +1557,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
 @main
 enum Main {
-    static func main() {
+    @MainActor static func main() {
+        // `WidgetDock --screenshot out.png` draws a sample dock (made-up data) to an image and exits.
+        if let i = CommandLine.arguments.firstIndex(of: "--screenshot"), i + 1 < CommandLine.arguments.count {
+            DockStore.demo = true
+            _ = NSApplication.shared
+            let store = DockStore.shared
+            store.loadDemo()
+            let view = DockView().environmentObject(store)
+                .padding(.horizontal, 30).padding(.top, 60).padding(.bottom, 6)
+                .background(LinearGradient(colors: [Color(red: 0.16, green: 0.25, blue: 0.55), Color(red: 0.55, green: 0.25, blue: 0.55), Color(red: 0.95, green: 0.55, blue: 0.35)],
+                                           startPoint: .topLeading, endPoint: .bottomTrailing))
+                .environment(\.colorScheme, .dark)
+            let renderer = ImageRenderer(content: view)
+            renderer.scale = 2
+            // Convert to plain sRGB; the renderer can hand back an HDR image that looks washed out in browsers.
+            guard let cg = renderer.cgImage,
+                  let rep = NSBitmapImageRep(cgImage: cg).converting(to: .sRGB, renderingIntent: .default),
+                  let png = rep.representation(using: .png, properties: [:]) else { exit(1) }
+            try? png.write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
+            exit(0)
+        }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
