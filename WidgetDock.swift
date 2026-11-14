@@ -127,6 +127,15 @@ struct TileInfo {
         .init(id: "trash", name: "Trash"),
     ]
     static func name(_ id: String) -> String { all.first { $0.id == id }?.name ?? id }
+
+    /// A saved tile order brought up to date: unknown tiles dropped, new ones added just before the Trash.
+    static func mergedOrder(saved: [String]) -> [String] {
+        var order = saved.filter { id in all.contains { $0.id == id } }
+        for t in all where !order.contains(t.id) {
+            if let i = order.firstIndex(of: "trash") { order.insert(t.id, at: i) } else { order.append(t.id) }
+        }
+        return order
+    }
 }
 
 func appName(_ path: String) -> String {
@@ -161,44 +170,50 @@ func run(_ tool: String, _ args: [String]) -> Int32 {
     return p.terminationStatus
 }
 
-// Private IOKit HID calls used to read Apple Silicon temperature sensors (same approach as TempBar, no root needed).
-@_silgen_name("IOHIDEventSystemClientCreate")
-func IOHIDEventSystemClientCreate(_ allocator: CFAllocator?) -> OpaquePointer?
-@_silgen_name("IOHIDEventSystemClientSetMatching")
-func IOHIDEventSystemClientSetMatching(_ client: OpaquePointer, _ matching: CFDictionary) -> Int32
-@_silgen_name("IOHIDEventSystemClientCopyServices")
-func IOHIDEventSystemClientCopyServices(_ client: OpaquePointer) -> Unmanaged<CFArray>?
-@_silgen_name("IOHIDServiceClientCopyProperty")
-func IOHIDServiceClientCopyProperty(_ service: OpaquePointer, _ key: CFString) -> Unmanaged<CFTypeRef>?
-@_silgen_name("IOHIDServiceClientCopyEvent")
-func IOHIDServiceClientCopyEvent(_ service: OpaquePointer, _ type: Int64, _ options: Int32, _ timestamp: Int64) -> Unmanaged<CFTypeRef>?
-@_silgen_name("IOHIDEventGetFloatValue")
-func IOHIDEventGetFloatValue(_ event: OpaquePointer, _ field: Int32) -> Double
-
+/// Reads Apple Silicon temperature sensors through IOKit calls that Apple does not document.
+/// They are looked up by name while the app runs. If a macOS update removes one, the reading is simply
+/// unavailable and the stats tile shows the system's own heat level instead; the app still starts.
 final class TempSensors {
+    private typealias Create = @convention(c) (CFAllocator?) -> OpaquePointer?
+    private typealias SetMatching = @convention(c) (OpaquePointer, CFDictionary) -> Int32
+    private typealias CopyServices = @convention(c) (OpaquePointer) -> Unmanaged<CFArray>?
+    private typealias CopyProperty = @convention(c) (OpaquePointer, CFString) -> Unmanaged<CFTypeRef>?
+    private typealias CopyEvent = @convention(c) (OpaquePointer, Int64, Int32, Int64) -> Unmanaged<CFTypeRef>?
+    private typealias GetFloat = @convention(c) (OpaquePointer, Int32) -> Double
+
+    private static func lookup<T>(_ name: String, as type: T.Type) -> T? {
+        // -2 is RTLD_DEFAULT: search everything the app has loaded.
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), name) else { return nil }
+        return unsafeBitCast(symbol, to: type)
+    }
+
     private static let temperatureEvent: Int64 = 15
+    private let copyServices = lookup("IOHIDEventSystemClientCopyServices", as: CopyServices.self)
+    private let copyProperty = lookup("IOHIDServiceClientCopyProperty", as: CopyProperty.self)
+    private let copyEvent = lookup("IOHIDServiceClientCopyEvent", as: CopyEvent.self)
+    private let getFloat = lookup("IOHIDEventGetFloatValue", as: GetFloat.self)
     private let client: OpaquePointer?
 
     init() {
-        client = IOHIDEventSystemClientCreate(kCFAllocatorDefault)
-        if let client {
-            _ = IOHIDEventSystemClientSetMatching(client, ["PrimaryUsagePage": 0xff00, "PrimaryUsage": 5] as CFDictionary)
-        }
+        guard let create = Self.lookup("IOHIDEventSystemClientCreate", as: Create.self),
+              let setMatching = Self.lookup("IOHIDEventSystemClientSetMatching", as: SetMatching.self),
+              let made = create(kCFAllocatorDefault) else { client = nil; return }
+        _ = setMatching(made, ["PrimaryUsagePage": 0xff00, "PrimaryUsage": 5] as CFDictionary)
+        client = made
     }
 
-    /// CPU die temperature in °C: hottest "tdie" sensor, falling back to the hottest of anything.
+    /// Chip temperature in °C: the hottest "tdie" sensor, or the hottest of anything if there is none.
     func cpuTemp() -> Double? {
-        guard let client,
-              let services = IOHIDEventSystemClientCopyServices(client)?.takeRetainedValue() as? [AnyObject]
+        guard let client, let copyServices, let copyProperty, let copyEvent, let getFloat,
+              let services = copyServices(client)?.takeRetainedValue() as? [AnyObject]
         else { return nil }
         var dies: [Double] = [], all: [Double] = []
         for obj in services {
             let service = OpaquePointer(Unmanaged.passUnretained(obj).toOpaque())
-            guard let name = IOHIDServiceClientCopyProperty(service, "Product" as CFString)?.takeRetainedValue() as? String,
-                  let event = IOHIDServiceClientCopyEvent(service, Self.temperatureEvent, 0, 0)?.takeRetainedValue()
+            guard let name = copyProperty(service, "Product" as CFString)?.takeRetainedValue() as? String,
+                  let event = copyEvent(service, Self.temperatureEvent, 0, 0)?.takeRetainedValue()
             else { continue }
-            let value = IOHIDEventGetFloatValue(OpaquePointer(Unmanaged.passUnretained(event).toOpaque()),
-                                                Int32(Self.temperatureEvent << 16))
+            let value = getFloat(OpaquePointer(Unmanaged.passUnretained(event).toOpaque()), Int32(Self.temperatureEvent << 16))
             guard value > 0 && value < 150 else { continue }
             all.append(value)
             if name.lowercased().contains("tdie") { dies.append(value) }
@@ -356,6 +371,8 @@ final class DockStore: ObservableObject {
     @Published var charging = false
     @Published var cpuTemp: Double?
     private let sensors = TempSensors()
+    /// macOS's own heat level; shown when the temperature sensors can't be read.
+    @Published var thermal: ProcessInfo.ThermalState = .nominal
     @Published var track: Track?
     @Published var art: NSImage?
     @Published var running: Set<String> = []
@@ -405,13 +422,8 @@ final class DockStore: ObservableObject {
         autoLocation = d.object(forKey: "autoLocation") != nil ? d.bool(forKey: "autoLocation") : true
         keepWindowsClear = d.bool(forKey: "keepWindowsClear")
         fahrenheit = d.object(forKey: "fahrenheit") != nil ? d.bool(forKey: "fahrenheit") : Locale.current.measurementSystem == .us
-        var order = d.stringArray(forKey: "tileOrder") ?? []
-        // New tiles go in just before the Trash.
-        for t in TileInfo.all where !order.contains(t.id) {
-            if let i = order.firstIndex(of: "trash") { order.insert(t.id, at: i) } else { order.append(t.id) }
-        }
+        tileOrder = TileInfo.mergedOrder(saved: d.stringArray(forKey: "tileOrder") ?? [])
         note = d.string(forKey: "note") ?? ""
-        tileOrder = order.filter { id in TileInfo.all.contains { $0.id == id } }
         hiddenTiles = d.stringArray(forKey: "hiddenTiles") ?? []
         userScale = d.object(forKey: "scale") != nil ? d.double(forKey: "scale") : 1
         allDisplays = d.object(forKey: "allDisplays") != nil ? d.bool(forKey: "allDisplays") : true
@@ -452,6 +464,8 @@ final class DockStore: ObservableObject {
         mem = readMemory()
         readBattery()
         cpuTemp = sensors.cpuTemp()
+        let heat = ProcessInfo.processInfo.thermalState
+        if heat != thermal { thermal = heat }
         refreshRunning()
         refreshBadges()
         refreshMusic()
@@ -469,9 +483,6 @@ final class DockStore: ObservableObject {
             let root = fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
             let weekAgo = Date().addingTimeInterval(-7 * 86400)
             let midnight = Calendar.current.startOfDay(for: Date())
-            let iso = ISO8601DateFormatter()
-            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let marker = Data("\"usage\"".utf8)
             var seen: [String: (stamp: Date, rows: [String: UsageRow])] = [:]
 
             let walker = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])
@@ -481,36 +492,48 @@ final class DockStore: ObservableObject {
                       stamp >= weekAgo else { continue }
                 if let old = self.usageFiles[url.path], old.stamp == stamp { seen[url.path] = old; continue }
                 guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { continue }
-                var rows: [String: UsageRow] = [:]
-                for line in data.split(separator: 0x0A) where line.range(of: marker) != nil {
-                    guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-                          let msg = obj["message"] as? [String: Any],
-                          let u = msg["usage"] as? [String: Any],
-                          let when = (obj["timestamp"] as? String).flatMap({ iso.date(from: $0) }) else { continue }
-                    // One reply can be logged on several lines; the id keeps it from being counted twice.
-                    let id = (msg["id"] as? String ?? "") + (obj["requestId"] as? String ?? (obj["uuid"] as? String ?? ""))
-                    rows[id] = UsageRow(date: when,
-                                        input: u["input_tokens"] as? Int ?? 0,
-                                        output: u["output_tokens"] as? Int ?? 0,
-                                        cacheWrite: u["cache_creation_input_tokens"] as? Int ?? 0,
-                                        cacheRead: u["cache_read_input_tokens"] as? Int ?? 0)
-                }
-                seen[url.path] = (stamp, rows)
+                seen[url.path] = (stamp, Self.parseUsage(data))
             }
             self.usageFiles = seen
 
             var all: [String: UsageRow] = [:]
             for file in seen.values { all.merge(file.rows) { a, _ in a } }
-            var today = Usage(), week = Usage()
-            for r in all.values where r.date >= weekAgo {
-                week.add(r)
-                if r.date >= midnight { today.add(r) }
-            }
+            let (today, week) = Self.usageTotals(all.values, weekAgo: weekAgo, midnight: midnight)
             DispatchQueue.main.async {
                 if self.usageToday != today { self.usageToday = today }
                 if self.usageWeek != week { self.usageWeek = week }
             }
         }
+    }
+
+    /// The replies in one Claude Code log file, keyed so a reply logged on several lines is counted once.
+    static func parseUsage(_ data: Data) -> [String: UsageRow] {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let marker = Data("\"usage\"".utf8)
+        var rows: [String: UsageRow] = [:]
+        for line in data.split(separator: 0x0A) where line.range(of: marker) != nil {
+            guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  let msg = obj["message"] as? [String: Any],
+                  let u = msg["usage"] as? [String: Any],
+                  let when = (obj["timestamp"] as? String).flatMap({ iso.date(from: $0) }) else { continue }
+            let id = (msg["id"] as? String ?? "") + (obj["requestId"] as? String ?? (obj["uuid"] as? String ?? ""))
+            rows[id] = UsageRow(date: when,
+                                input: u["input_tokens"] as? Int ?? 0,
+                                output: u["output_tokens"] as? Int ?? 0,
+                                cacheWrite: u["cache_creation_input_tokens"] as? Int ?? 0,
+                                cacheRead: u["cache_read_input_tokens"] as? Int ?? 0)
+        }
+        return rows
+    }
+
+    static func usageTotals(_ rows: some Sequence<UsageRow>, weekAgo: Date, midnight: Date) -> (today: Usage, week: Usage) {
+        var today = Usage(), week = Usage()
+        for r in rows where r.date >= weekAgo {
+            week.add(r)
+            if r.date >= midnight { today.add(r) }
+        }
+        return (today, week)
     }
 
     // MARK: Tools (focus timer, clipboard, sound and display)
@@ -531,12 +554,12 @@ final class DockStore: ObservableObject {
     }
 
     /// When focus time runs out a break starts by itself; when the break ends the timer waits for a click.
-    private func checkPomodoro() {
-        guard let end = pomoEnd, end <= Date() else { return }
-        NSSound(named: "Glass")?.play()
+    func checkPomodoro(now: Date = Date()) {
+        guard let end = pomoEnd, end <= now else { return }
+        if !DockStore.demo { NSSound(named: "Glass")?.play() }
         pomoBreak.toggle()
         pomoLeft = pomoBreak ? Self.breakLength : Self.focusLength
-        pomoEnd = pomoBreak ? Date().addingTimeInterval(pomoLeft) : nil
+        pomoEnd = pomoBreak ? now.addingTimeInterval(pomoLeft) : nil
     }
 
     private func checkClipboard() {
@@ -549,9 +572,12 @@ final class DockStore: ObservableObject {
         guard !(pb.types ?? []).contains(where: { secret.contains($0.rawValue) }),
               let text = pb.string(forType: .string),
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        clips.removeAll { $0 == text }
-        clips.insert(text, at: 0)
-        if clips.count > 12 { clips.removeLast(clips.count - 12) }
+        clips = Self.pushClip(text, onto: clips)
+    }
+
+    /// Newest first, no repeats, at most 12.
+    static func pushClip(_ text: String, onto list: [String]) -> [String] {
+        Array(([text] + list.filter { $0 != text }).prefix(12))
     }
 
     func copyClip(_ text: String) {
@@ -654,14 +680,18 @@ final class DockStore: ObservableObject {
         var list: [BrowserProfile] = []
         if let id = Bundle(path: path)?.bundleIdentifier, let folder = Self.browserFolders[id],
            let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first,
-           let data = try? Data(contentsOf: support.appendingPathComponent(folder).appendingPathComponent("Local State")),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let cache = (json["profile"] as? [String: Any])?["info_cache"] as? [String: [String: Any]] {
-            list = cache.map { BrowserProfile(dir: $0.key, name: ($0.value["name"] as? String) ?? $0.key) }
-                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+           let data = try? Data(contentsOf: support.appendingPathComponent(folder).appendingPathComponent("Local State")) {
+            list = Self.parseProfiles(data)
         }
         profileCache[path] = (Date(), list)
         return list
+    }
+
+    static func parseProfiles(_ localState: Data) -> [BrowserProfile] {
+        guard let json = try? JSONSerialization.jsonObject(with: localState) as? [String: Any],
+              let cache = (json["profile"] as? [String: Any])?["info_cache"] as? [String: [String: Any]] else { return [] }
+        return cache.map { BrowserProfile(dir: $0.key, name: ($0.value["name"] as? String) ?? $0.key) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     func openProfile(_ path: String, _ profile: BrowserProfile) {
@@ -970,15 +1000,24 @@ final class DockStore: ObservableObject {
             .filter { !$0.isAllDay && $0.endDate > now && $0.status != .canceled }
             .sorted { $0.startDate < $1.startDate }
         // Long blocks (over 3 hours) would hide real meetings, so they only show when nothing else is coming.
-        let next = upcoming.first { $0.endDate.timeIntervalSince($0.startDate) <= 3 * 3600 } ?? upcoming.first
+        let next = Self.nextIndex(upcoming.map { ($0.startDate, $0.endDate) }).map { upcoming[$0] }
         let ev = next.map {
             NextEvent(title: $0.title ?? "Event", start: $0.startDate, end: $0.endDate, joinURL: Self.joinLink(in: $0))
         }
         if ev != nextEvent { nextEvent = ev }
     }
 
+    /// Which of the coming events (soonest first) to show. Long blocks (over 3 hours) would hide real
+    /// meetings, so one is only picked when nothing shorter is coming.
+    static func nextIndex(_ spans: [(start: Date, end: Date)]) -> Int? {
+        spans.firstIndex { $0.end.timeIntervalSince($0.start) <= 3 * 3600 } ?? (spans.isEmpty ? nil : 0)
+    }
+
     private static func joinLink(in e: EKEvent) -> URL? {
-        let text = [e.url?.absoluteString, e.location, e.notes].compactMap { $0 }.joined(separator: " ")
+        joinLink(inText: [e.url?.absoluteString, e.location, e.notes].compactMap { $0 }.joined(separator: " "))
+    }
+
+    static func joinLink(inText text: String) -> URL? {
         let pattern = #"https://[^\s<>"]*(zoom\.us|meet\.google\.com|teams\.microsoft\.com|teams\.live\.com|webex\.com)[^\s<>"]*"#
         guard let r = text.range(of: pattern, options: .regularExpression) else { return nil }
         return URL(string: String(text[r]))
@@ -1143,7 +1182,7 @@ struct WeatherTile: View {
 struct CalendarTile: View {
     @EnvironmentObject var store: DockStore
 
-    private func subtitle(_ e: NextEvent, now: Date) -> String {
+    static func subtitle(_ e: NextEvent, now: Date) -> String {
         if e.start <= now { return "Now · ends \(e.end.formatted(date: .omitted, time: .shortened))" }
         let mins = Int(e.start.timeIntervalSince(now) / 60)
         if mins < 60 { return "in \(max(1, mins)) min" }
@@ -1174,7 +1213,7 @@ struct CalendarTile: View {
                             .font(store.titleFont)
                             .lineLimit(1)
                     }
-                    Text((e.map { subtitle($0, now: ctx.date) } ?? (store.calendarDenied ? "Allow in System Settings" : "Next 7 days are clear"))
+                    Text((e.map { Self.subtitle($0, now: ctx.date) } ?? (store.calendarDenied ? "Allow in System Settings" : "Next 7 days are clear"))
                          + (canJoin ? " · click to join" : ""))
                         .font(store.captionFont)
                         .foregroundStyle(soon ? Color.red : Color.secondary)
@@ -1420,6 +1459,10 @@ struct StatsTile: View {
                     // Ring fills toward 100°C; the number follows the weather unit setting.
                     let shown = store.fahrenheit ? c * 9 / 5 + 32 : c
                     Ring(value: c / 100, label: "TEMP", color: c > 85 ? .red : .orange, text: "\(Int(shown.rounded()))°")
+                } else {
+                    let level = min(3, max(0, store.thermal.rawValue))
+                    Ring(value: [0.25, 0.5, 0.8, 1][level], label: "HEAT",
+                         color: [Color.green, .orange, .red, .red][level], text: ["OK", "Warm", "Hot", "Max"][level])
                 }
                 if let b = store.battery {
                     Ring(value: b, label: store.charging ? "CHG" : "BAT", color: b < 0.2 ? .red : .green)
@@ -1901,6 +1944,134 @@ struct SettingsView: View {
 
 // MARK: - App
 
+// MARK: - Self-test
+
+/// Checks of the app's own logic, run by `build.sh` before every install and by GitHub on every push.
+/// It runs against a throwaway settings store, never the real one, and sends no clicks or keys.
+enum SelfTest {
+    private static var failed = 0, total = 0
+
+    private static func check(_ ok: Bool, _ name: String) {
+        total += 1
+        if !ok { failed += 1; print("FAIL  \(name)") }
+    }
+
+    static func run() -> Int32 {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        // Numbers
+        check(shortCount(999) == "999", "small counts are shown in full")
+        check(shortCount(12_345) == "12K", "thousands are shortened")
+        check(shortCount(1_250_000) == "1.2M" || shortCount(1_250_000) == "1.3M", "millions are shortened")
+        check(Usage(input: 1, output: 2, cacheWrite: 3, cacheRead: 99).tokens == 6, "cache reads stay out of the headline")
+
+        // Tiles
+        let fresh = TileInfo.mergedOrder(saved: [])
+        check(fresh == TileInfo.all.map(\.id), "a new install gets every tile in the default order")
+        let old = TileInfo.mergedOrder(saved: ["weather", "clock", "gone", "trash"])
+        check(old.prefix(2) == ["weather", "clock"] && old.last == "trash", "a saved order is kept, with new tiles before the Trash")
+        check(!old.contains("gone") && Set(old) == Set(TileInfo.all.map(\.id)), "unknown tiles are dropped and none are missing")
+
+        // Clipboard
+        var clips: [String] = []
+        for i in 1...20 { clips = DockStore.pushClip("item \(i)", onto: clips) }
+        check(clips.count == 12 && clips.first == "item 20", "clipboard keeps the newest 12")
+        check(DockStore.pushClip("item 15", onto: clips).first == "item 15" && DockStore.pushClip("item 15", onto: clips).count == 12,
+              "copying something again moves it to the top without a repeat")
+
+        // Claude usage
+        let log = """
+        {"timestamp":"2027-01-15T07:00:00.000Z","requestId":"r1","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000}}}
+        {"timestamp":"2027-01-15T07:00:01.000Z","requestId":"r1","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":7,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000}}}
+        {"timestamp":"2027-01-12T07:00:00.000Z","requestId":"r2","message":{"id":"m2","usage":{"input_tokens":1,"output_tokens":1}}}
+        {"timestamp":"2026-12-01T07:00:00.000Z","requestId":"r3","message":{"id":"m3","usage":{"input_tokens":500,"output_tokens":500}}}
+        {"type":"user","message":{"content":"this line mentions \\"usage\\" but has none"}}
+        not json at all "usage"
+        """
+        let rows = DockStore.parseUsage(Data(log.utf8))
+        check(rows.count == 3, "a reply logged twice is counted once, and bad lines are skipped")
+        let asOf = ISO8601DateFormatter().date(from: "2027-01-15T12:00:00Z")!
+        let totals = DockStore.usageTotals(rows.values, weekAgo: asOf.addingTimeInterval(-7 * 86400), midnight: asOf.addingTimeInterval(-12 * 3600))
+        check(totals.today.tokens == 117 && totals.today.messages == 1, "today's total uses the last copy of a repeated reply")
+        check(totals.week.tokens == 119 && totals.week.messages == 2, "the 7-day total leaves out older replies")
+
+        // Calendar
+        func span(_ startMin: Double, _ lengthMin: Double) -> (start: Date, end: Date) {
+            (now.addingTimeInterval(startMin * 60), now.addingTimeInterval((startMin + lengthMin) * 60))
+        }
+        check(DockStore.nextIndex([]) == nil, "no events means nothing to show")
+        check(DockStore.nextIndex([span(5, 480), span(30, 30)]) == 1, "an all-morning block does not hide the next meeting")
+        check(DockStore.nextIndex([span(5, 480)]) == 0, "a long block shows when nothing else is coming")
+        let event = NextEvent(title: "Standup", start: now.addingTimeInterval(12 * 60 + 30), end: now.addingTimeInterval(40 * 60), joinURL: nil)
+        check(CalendarTile.subtitle(event, now: now) == "in 12 min", "an event soon shows minutes to go")
+        check(CalendarTile.subtitle(event, now: event.start.addingTimeInterval(-20)) == "in 1 min", "it never says 0 minutes")
+        check(CalendarTile.subtitle(event, now: event.start.addingTimeInterval(60)).hasPrefix("Now"), "a running event says Now")
+        check(DockStore.joinLink(inText: "Room 4 https://us02web.zoom.us/j/123?pwd=abc notes")?.absoluteString == "https://us02web.zoom.us/j/123?pwd=abc", "a Zoom link is found")
+        check(DockStore.joinLink(inText: "Join: <https://meet.google.com/abc-defg-hij>")?.host == "meet.google.com", "a Meet link is found inside brackets")
+        check(DockStore.joinLink(inText: "see https://example.com/agenda") == nil, "ordinary links are not treated as meetings")
+
+        // Weather
+        check(Weather(temp: 0, high: 0, low: 0, code: 0, isDay: false).symbol == "moon.stars.fill", "clear night shows a moon")
+        check(Weather(temp: 0, high: 0, low: 0, code: 63, isDay: true).symbol == "cloud.rain.fill", "rain shows rain")
+
+        // Browser profiles
+        let state = #"{"profile":{"info_cache":{"Profile 2":{"name":"work"},"Default":{"name":"Personal"},"Profile 5":{}}}}"#
+        let profiles = DockStore.parseProfiles(Data(state.utf8))
+        check(profiles.map(\.name) == ["Personal", "Profile 5", "work"], "browser profiles are listed by name")
+        check(DockStore.parseProfiles(Data("nope".utf8)).isEmpty, "a broken profile file gives no profiles")
+
+        // The store, against throwaway settings
+        let store = DockStore.shared
+        store.weather = nil
+        check(!store.weatherStale, "no weather is not called stale")
+        store.weather = Weather(temp: 1, high: 2, low: 0, code: 0, isDay: true)
+        store.weatherAt = Date().addingTimeInterval(-10 * 60)
+        check(!store.weatherStale, "10-minute-old weather is current")
+        store.weatherAt = Date().addingTimeInterval(-3 * 3600)
+        check(store.weatherStale, "3-hour-old weather is marked old")
+
+        let folder = AppFolder(name: "Work", apps: ["/x/C.app"])
+        store.items = [.app("/x/A.app"), .app("/x/B.app"), .folder(folder), .app("/x/D.app")]
+        store.moveItem("/x/A.app", by: 2)
+        check(store.items.map(\.id) == ["/x/B.app", folder.id.uuidString, "/x/A.app", "/x/D.app"], "dragging an app moves it")
+        store.moveItem("/x/A.app", by: 99)
+        check(store.items.last == .app("/x/A.app"), "dragging past the end stops at the end")
+        store.move("/x/B.app", to: folder.id)
+        check(store.folders.first?.apps == ["/x/C.app", "/x/B.app"] && !store.items.contains(.app("/x/B.app")), "an app can move into a folder")
+        check(store.pinnedPaths == ["/x/A.app", "/x/B.app", "/x/C.app", "/x/D.app"], "apps inside folders still count as pinned")
+        store.moveOut("/x/C.app", of: folder.id)
+        check(store.folders.first?.apps == ["/x/B.app"] && store.items.last == .app("/x/C.app"), "an app can move back out")
+        store.removeFolder(folder.id)
+        check(store.folders.isEmpty && store.items.contains(.app("/x/B.app")), "removing a folder keeps its apps")
+        store.addApp("/x/A.app"); store.addApp("/x/notes.txt")
+        check(store.items.filter { $0 == .app("/x/A.app") }.count == 1 && !store.items.contains(.app("/x/notes.txt")), "no duplicates, and only apps can be added")
+        if let data = try? JSONEncoder().encode(store.items), let back = try? JSONDecoder().decode([DockItem].self, from: data) {
+            check(back == store.items, "the app list survives saving and loading")
+        } else { check(false, "the app list survives saving and loading") }
+
+        store.setTile("weather", visible: false)
+        check(!store.visibleTiles.contains("weather"), "a tile can be hidden")
+        store.setTile("weather", visible: true)
+        check(store.visibleTiles.contains("weather"), "and shown again")
+
+        store.pomoReset()
+        store.pomoToggle()
+        check(store.pomoEnd != nil && !store.pomoBreak, "the focus timer starts")
+        store.checkPomodoro(now: Date().addingTimeInterval(DockStore.focusLength + 5))
+        check(store.pomoBreak && store.pomoEnd != nil && store.pomoLeft == DockStore.breakLength, "a break starts when focus time runs out")
+        store.checkPomodoro(now: Date().addingTimeInterval(DockStore.focusLength + DockStore.breakLength + 60))
+        check(!store.pomoBreak && store.pomoEnd == nil && store.pomoLeft == DockStore.focusLength, "after the break the timer waits")
+        store.pomoToggle(); store.pomoToggle()
+        check(store.pomoEnd == nil && store.pomoLeft <= DockStore.focusLength && store.pomoLeft > DockStore.focusLength - 5, "pausing keeps the time left")
+
+        UserDefaults.standard.removePersistentDomain(forName: "local.widgetdock.demo")
+        // Not a check: sensors differ by Mac, and test machines in the cloud have none.
+        print("temperature sensor: " + (TempSensors().cpuTemp().map { String(format: "%.0f°C", $0) } ?? "not available, heat level is shown instead"))
+        print("\(total - failed) of \(total) checks passed")
+        return failed == 0 ? 0 : 1
+    }
+}
+
 final class DockPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
@@ -2082,6 +2253,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 @main
 enum Main {
     @MainActor static func main() {
+        // `WidgetDock --selftest` checks the app's logic and exits with 0 only if every check passes.
+        if CommandLine.arguments.contains("--selftest") {
+            DockStore.demo = true
+            exit(SelfTest.run())
+        }
         // `WidgetDock --usage` prints the Claude Code token counts the usage tile shows, then exits.
         if CommandLine.arguments.contains("--usage") {
             let store = DockStore.shared

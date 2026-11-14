@@ -6,6 +6,8 @@ APP=build/WidgetDock.app
 rm -rf build
 mkdir -p "$APP/Contents/MacOS"
 swiftc -O -target arm64-apple-macos14.0 -swift-version 5 -parse-as-library WidgetDock.swift -o "$APP/Contents/MacOS/WidgetDock"
+# Stop here, before anything is installed, if the app's own checks fail.
+"$APP/Contents/MacOS/WidgetDock" --selftest
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -15,7 +17,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleIdentifier</key><string>local.widgetdock</string>
     <key>CFBundleExecutable</key><string>WidgetDock</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.2</string>
+    <key>CFBundleShortVersionString</key><string>1.3</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
     <key>NSAppleEventsUsageDescription</key><string>WidgetDock shows the song playing in Music or Spotify and switches light and dark mode.</string>

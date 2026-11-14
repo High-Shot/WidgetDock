@@ -55,6 +55,16 @@ Turn off **Replace the system Dock** in Settings, choose **Quit WidgetDock**, th
 - Badges and "keep windows above the dock" need the Accessibility permission.
 - Temperature uses private IOKit calls, so it may break on a future macOS.
 
+## Tests
+
+`build.sh` runs the app's self-test before it installs anything and stops if a check fails. To run it on its own after a build:
+
+```bash
+~/WidgetDock/build/WidgetDock.app/Contents/MacOS/WidgetDock --selftest
+```
+
+It checks the app's logic (tile order, app and folder moves, clipboard history, calendar picking, meeting links, usage counting, the focus timer) against throwaway settings. It never touches your real settings and sends no clicks or keys. GitHub runs the same checks on every push.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

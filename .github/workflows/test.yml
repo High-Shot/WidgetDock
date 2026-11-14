@@ -1,0 +1,11 @@
+name: Tests
+on: [push, pull_request]
+jobs:
+  selftest:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: swiftc -O -target arm64-apple-macos14.0 -swift-version 5 -parse-as-library WidgetDock.swift -o WidgetDock
+      - name: Run the app's self-test
+        run: ./WidgetDock --selftest
