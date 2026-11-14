@@ -101,6 +101,11 @@ func shortCount(_ n: Int) -> String {
     }
 }
 
+struct BrowserProfile: Hashable {
+    let dir: String
+    let name: String
+}
+
 struct TileInfo {
     let id: String
     let name: String
@@ -416,6 +421,12 @@ final class DockStore: ObservableObject {
         replaceDock = d.bool(forKey: "replaceDock")
     }
 
+    /// Every tile uses the same two text styles, so the bar reads as one piece.
+    var titleFont: Font { .system(size: 16 * scale, weight: .semibold, design: .rounded) }
+    var captionFont: Font { .system(size: 10 * scale, weight: .medium, design: .rounded) }
+    /// Icons that sit beside a title line.
+    var inlineIcon: Font { .system(size: 15 * scale, weight: .medium) }
+
     var visibleTiles: [String] { tileOrder.filter { !hiddenTiles.contains($0) } }
 
     func start() {
@@ -625,6 +636,42 @@ final class DockStore: ObservableObject {
     }
 
     /// Clicking the app you're already in hides it; otherwise it opens or comes to the front.
+    // MARK: Browser profiles (Chrome and its relatives list them in a "Local State" file)
+
+    private static let browserFolders: [String: String] = [
+        "com.google.Chrome": "Google/Chrome",
+        "com.google.Chrome.beta": "Google/Chrome Beta",
+        "com.google.Chrome.canary": "Google/Chrome Canary",
+        "com.brave.Browser": "BraveSoftware/Brave-Browser",
+        "com.microsoft.edgemac": "Microsoft Edge",
+        "com.vivaldi.Vivaldi": "Vivaldi",
+    ]
+    private var profileCache: [String: (at: Date, list: [BrowserProfile])] = [:]
+
+    /// The browser's profiles, by name. Empty for apps that are not a supported browser. Re-read at most once a minute.
+    func browserProfiles(_ path: String) -> [BrowserProfile] {
+        if let hit = profileCache[path], Date().timeIntervalSince(hit.at) < 60 { return hit.list }
+        var list: [BrowserProfile] = []
+        if let id = Bundle(path: path)?.bundleIdentifier, let folder = Self.browserFolders[id],
+           let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first,
+           let data = try? Data(contentsOf: support.appendingPathComponent(folder).appendingPathComponent("Local State")),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let cache = (json["profile"] as? [String: Any])?["info_cache"] as? [String: [String: Any]] {
+            list = cache.map { BrowserProfile(dir: $0.key, name: ($0.value["name"] as? String) ?? $0.key) }
+                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        }
+        profileCache[path] = (Date(), list)
+        return list
+    }
+
+    func openProfile(_ path: String, _ profile: BrowserProfile) {
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.arguments = ["--profile-directory=\(profile.dir)"]
+        // A second launch hands the request to the browser that is already open, which shows that profile's window.
+        cfg.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: path), configuration: cfg)
+    }
+
     func activate(_ path: String) {
         if let front = NSWorkspace.shared.frontmostApplication, front.bundleURL?.path == path {
             front.hide()
@@ -1045,12 +1092,12 @@ struct ClockTile: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { ctx in
             Tile {
-                VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 2 * store.scale) {
                     Text(ctx.date, format: .dateTime.hour().minute())
-                        .font(.system(size: 24 * store.scale, weight: .semibold, design: .rounded))
+                        .font(store.titleFont)
                         .monospacedDigit()
                     Text(ctx.date, format: .dateTime.weekday(.abbreviated).month(.abbreviated).day())
-                        .font(.system(size: 11 * store.scale, weight: .medium))
+                        .font(store.captionFont)
                         .foregroundStyle(.secondary)
                 }
                 .fixedSize()
@@ -1063,21 +1110,21 @@ struct WeatherTile: View {
     @EnvironmentObject var store: DockStore
     var body: some View {
         Tile {
-            HStack(spacing: 8 * store.scale) {
-                Image(systemName: store.weather?.symbol ?? "cloud.slash")
-                    .symbolRenderingMode(.multicolor)
-                    .font(.system(size: 24 * store.scale))
-                VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 2 * store.scale) {
+                HStack(spacing: 5 * store.scale) {
+                    Image(systemName: store.weather?.symbol ?? "cloud.slash")
+                        .symbolRenderingMode(.multicolor)
+                        .font(store.inlineIcon)
                     Text(store.weather.map { "\(Int($0.temp.rounded()))°" } ?? "--°")
-                        .font(.system(size: 20 * store.scale, weight: .semibold, design: .rounded))
+                        .font(store.titleFont)
                         .opacity(store.weatherStale ? 0.5 : 1)
-                    Text(subtitle)
-                        .font(.system(size: 10 * store.scale, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
                 }
-                .fixedSize()
+                Text(subtitle)
+                    .font(store.captionFont)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
+            .fixedSize()
         }
         .help(store.weatherNote.map { "Weather for \(store.placeName): \($0)" } ?? "Weather for \(store.placeName)")
     }
@@ -1116,23 +1163,25 @@ struct CalendarTile: View {
         TimelineView(.periodic(from: .now, by: 30)) { ctx in
             let e = store.nextEvent
             let soon = e.map { $0.start.timeIntervalSince(ctx.date) < 15 * 60 } ?? false
+            let canJoin = soon && e?.joinURL != nil
             Tile {
-                HStack(spacing: 8 * store.scale) {
-                    Image(systemName: e?.joinURL != nil && soon ? "video.fill" : "calendar")
-                        .font(.system(size: 20 * store.scale, weight: .medium))
-                        .foregroundStyle(soon ? Color.red : Color.primary)
-                    VStack(alignment: .leading, spacing: 1) {
+                VStack(alignment: .leading, spacing: 2 * store.scale) {
+                    HStack(spacing: 5 * store.scale) {
+                        Image(systemName: canJoin ? "video.fill" : "calendar")
+                            .font(store.inlineIcon)
+                            .foregroundStyle(soon ? Color.red : Color.primary)
                         Text(e?.title ?? (store.calendarDenied ? "No calendar access" : "No upcoming events"))
-                            .font(.system(size: 12 * store.scale, weight: .semibold))
-                            .lineLimit(1)
-                        Text(e.map { subtitle($0, now: ctx.date) } ?? (store.calendarDenied ? "Allow in System Settings" : "Next 7 days are clear"))
-                            .font(.system(size: 10 * store.scale, weight: .medium))
-                            .foregroundStyle(soon ? Color.red : Color.secondary)
+                            .font(store.titleFont)
                             .lineLimit(1)
                     }
-                    .frame(maxWidth: 150 * store.scale, alignment: .leading)
-                    .fixedSize()
+                    Text((e.map { subtitle($0, now: ctx.date) } ?? (store.calendarDenied ? "Allow in System Settings" : "Next 7 days are clear"))
+                         + (canJoin ? " · click to join" : ""))
+                        .font(store.captionFont)
+                        .foregroundStyle(soon ? Color.red : Color.secondary)
+                        .lineLimit(1)
                 }
+                .frame(maxWidth: 190 * store.scale, alignment: .leading)
+                .fixedSize()
             }
             .contentShape(Rectangle())
             .onTapGesture { open(e) }
@@ -1182,6 +1231,12 @@ struct AppIcon: View {
         .help(name)
         .contextMenu {
             Button("Open \(name)") { store.launch(path) }
+            let profiles = store.browserProfiles(path)
+            if profiles.count > 1 {
+                Divider()
+                ForEach(profiles, id: \.self) { p in Button(p.name) { store.openProfile(path, p) } }
+                Divider()
+            }
             Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
             Divider()
             if let folder {
@@ -1343,12 +1398,12 @@ struct Ring: View {
                     .rotationEffect(.degrees(-90))
                     .animation(.easeOut(duration: 0.5), value: value)
                 Text(text ?? "\(Int((value * 100).rounded()))")
-                    .font(.system(size: 10 * store.scale, weight: .semibold, design: .rounded))
+                    .font(store.captionFont.weight(.semibold))
                     .monospacedDigit()
             }
             .frame(width: 32 * store.scale, height: 32 * store.scale)
             Text(label)
-                .font(.system(size: 8 * store.scale, weight: .semibold))
+                .font(.system(size: 8 * store.scale, weight: .medium, design: .rounded))
                 .foregroundStyle(.secondary)
         }
     }
@@ -1398,9 +1453,9 @@ struct MusicTile: View {
                         NSWorkspace.shared.openApplication(at: url, configuration: .init())
                     }
                 }
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(track.title).font(.system(size: 12 * store.scale, weight: .semibold)).lineLimit(1)
-                    Text(track.artist).font(.system(size: 10 * store.scale)).foregroundStyle(.secondary).lineLimit(1)
+                VStack(alignment: .leading, spacing: 2 * store.scale) {
+                    Text(track.title).font(store.titleFont).lineLimit(1)
+                    Text(track.artist).font(store.captionFont).foregroundStyle(.secondary).lineLimit(1)
                 }
                 .frame(maxWidth: 130 * store.scale, alignment: .leading)
                 .fixedSize()
@@ -1428,9 +1483,9 @@ struct TodoTile: View {
     var body: some View {
         Tile {
             VStack(spacing: 3) {
-                Image(systemName: "checklist").font(.system(size: 20 * store.scale, weight: .medium))
+                Image(systemName: "checklist").font(.system(size: 18 * store.scale, weight: .medium))
                 Text(remaining == 0 ? "Todos" : "\(remaining) left")
-                    .font(.system(size: 9 * store.scale, weight: .semibold))
+                    .font(store.captionFont)
                     .foregroundStyle(.secondary)
             }
             .frame(minWidth: 40 * store.scale)
@@ -1492,7 +1547,7 @@ struct ToolFace: View {
                     .foregroundStyle(tint)
                 if let label {
                     Text(label)
-                        .font(.system(size: 9 * store.scale, weight: .semibold, design: .rounded))
+                        .font(store.captionFont)
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
