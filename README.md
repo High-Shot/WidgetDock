@@ -2,15 +2,49 @@
 
 A second Dock for macOS with live widgets: clock, weather, next calendar event, apps and folders, system stats (CPU, memory, temperature, battery), now playing, todos and trash. It can replace the system Dock.
 
-## Build
+## Install
 
-Needs macOS 14 or later on Apple Silicon and the Xcode command line tools.
+You need an Apple Silicon Mac (M1 or newer) running macOS 14 or later. There is no ready-made download, so you build it once on your own Mac. It takes about two minutes.
+
+1. Open the **Terminal** app.
+2. Install Apple's command line tools (skip this if you already have them). A window pops up; click Install and wait for it to finish.
+
+   ```bash
+   xcode-select --install
+   ```
+
+3. Download WidgetDock.
+
+   ```bash
+   git clone https://github.com/High-Shot/WidgetDock.git ~/WidgetDock
+   ```
+
+4. Build and install it.
+
+   ```bash
+   ~/WidgetDock/build.sh
+   ```
+
+The dock appears at the bottom of your screen and the app is now in your Applications folder.
+
+## First run
+
+- Click the **gear** at the right end of the dock to open Settings.
+- Turn on **Replace the system Dock** to hide Apple's Dock, and **Start WidgetDock at login** to keep it after a restart.
+- macOS will ask for permission the first time a feature needs it: Calendar (next event), Location (weather), Accessibility (badges and keeping windows above the dock), and Automation (music controls). Each one is optional.
+- Drag an app from the Applications folder onto the dock to add it. Right-click an app to remove it or put it in a folder. Drag icons sideways to reorder them.
+
+## Update
 
 ```bash
-./build.sh
+cd ~/WidgetDock && git pull && ./build.sh
 ```
 
-This builds the app, installs it in `/Applications` and starts it. Click the gear at the right end of the dock for settings.
+macOS may ask for the permissions again after an update.
+
+## Uninstall
+
+Turn off **Replace the system Dock** in Settings, choose **Quit WidgetDock**, then delete WidgetDock from Applications.
 
 ## Notes
 
