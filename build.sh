@@ -15,10 +15,10 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleIdentifier</key><string>local.widgetdock</string>
     <key>CFBundleExecutable</key><string>WidgetDock</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.1</string>
+    <key>CFBundleShortVersionString</key><string>1.2</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
-    <key>NSAppleEventsUsageDescription</key><string>WidgetDock shows and controls the song playing in Music or Spotify.</string>
+    <key>NSAppleEventsUsageDescription</key><string>WidgetDock shows the song playing in Music or Spotify and switches light and dark mode.</string>
     <key>NSCalendarsFullAccessUsageDescription</key><string>WidgetDock shows your next calendar event.</string>
     <key>NSLocationUsageDescription</key><string>WidgetDock shows the weather where you are.</string>
     <key>NSLocationWhenInUseUsageDescription</key><string>WidgetDock shows the weather where you are.</string>

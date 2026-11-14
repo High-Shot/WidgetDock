@@ -71,6 +71,36 @@ struct NextEvent: Equatable {
     var joinURL: URL?
 }
 
+/// Tokens used by Claude Code, counted from its session logs on this Mac.
+struct Usage: Equatable {
+    var input = 0
+    var output = 0
+    var cacheWrite = 0
+    var cacheRead = 0
+    var messages = 0
+    /// Cache reads are left out of the headline number: they are cheap and would swamp everything else.
+    var tokens: Int { input + output + cacheWrite }
+    mutating func add(_ r: UsageRow) {
+        input += r.input; output += r.output; cacheWrite += r.cacheWrite; cacheRead += r.cacheRead; messages += 1
+    }
+}
+
+struct UsageRow {
+    var date: Date
+    var input: Int
+    var output: Int
+    var cacheWrite: Int
+    var cacheRead: Int
+}
+
+func shortCount(_ n: Int) -> String {
+    switch n {
+    case 1_000_000...: return String(format: "%.1fM", Double(n) / 1_000_000)
+    case 1_000...: return "\(n / 1_000)K"
+    default: return "\(n)"
+    }
+}
+
 struct TileInfo {
     let id: String
     let name: String
@@ -82,6 +112,13 @@ struct TileInfo {
         .init(id: "stats", name: "System stats"),
         .init(id: "music", name: "Now playing"),
         .init(id: "todos", name: "Todos"),
+        .init(id: "pomodoro", name: "Focus timer"),
+        .init(id: "notes", name: "Notes"),
+        .init(id: "clipboard", name: "Clipboard history"),
+        .init(id: "screenshot", name: "Screenshot"),
+        .init(id: "downloads", name: "Downloads"),
+        .init(id: "controls", name: "Sound and display"),
+        .init(id: "claude", name: "Claude usage"),
         .init(id: "trash", name: "Trash"),
     ]
     static func name(_ id: String) -> String { all.first { $0.id == id }?.name ?? id }
@@ -223,6 +260,8 @@ final class DockStore: ObservableObject {
         nextEvent = NextEvent(title: "Team standup", start: Date().addingTimeInterval(12 * 60 + 30),
                               end: Date().addingTimeInterval(42 * 60), joinURL: URL(string: "https://meet.google.com/demo"))
         cpu = 0.14; mem = 0.62; cpuTemp = 41; battery = 0.86
+        usageToday = Usage(input: 210_000, output: 96_000, cacheWrite: 540_000, cacheRead: 9_800_000, messages: 212)
+        usageWeek = Usage(input: 1_300_000, output: 610_000, cacheWrite: 3_900_000, cacheRead: 71_000_000, messages: 1480)
         track = Track(title: "Midnight Drive", artist: "Example Artist", playing: true, playerID: "demo", artURL: nil)
         UserDefaults.standard.removePersistentDomain(forName: "local.widgetdock.demo")
     }
@@ -238,7 +277,11 @@ final class DockStore: ObservableObject {
     @Published var fahrenheit: Bool { didSet { d.set(fahrenheit, forKey: "fahrenheit"); refreshWeather() } }
     @Published var tileOrder: [String] { didSet { d.set(tileOrder, forKey: "tileOrder") } }
     @Published var hiddenTiles: [String] {
-        didSet { d.set(hiddenTiles, forKey: "hiddenTiles"); if !hiddenTiles.contains("calendar") { startCalendar() } }
+        didSet {
+            d.set(hiddenTiles, forKey: "hiddenTiles")
+            if !hiddenTiles.contains("calendar") { startCalendar() }
+            refreshUsage()
+        }
     }
     /// The size picked in Settings; `fitScale` shrinks it further when the bar would not fit the screen.
     @Published var userScale: Double { didSet { d.set(userScale, forKey: "scale") } }
@@ -260,6 +303,23 @@ final class DockStore: ObservableObject {
             if keepWindowsClear { DockStore.askForWindowControl() }
         }
     }
+    // Tools
+    static let focusLength: TimeInterval = 25 * 60
+    static let breakLength: TimeInterval = 5 * 60
+    @Published var note: String { didSet { d.set(note, forKey: "note") } }
+    /// Recent copied text. Kept in memory only, never written to disk.
+    @Published var clips: [String] = []
+    private var clipCount = NSPasteboard.general.changeCount
+    @Published var pomoEnd: Date?
+    @Published var pomoLeft: TimeInterval = DockStore.focusLength
+    @Published var pomoBreak = false
+    @Published var usageToday = Usage()
+    @Published var usageWeek = Usage()
+    private let usageQueue = DispatchQueue(label: "widgetdock.usage", qos: .utility)
+    /// Parsed log files by path, so only files that changed are read again. Used on `usageQueue` only.
+    private var usageFiles: [String: (stamp: Date, rows: [String: UsageRow])] = [:]
+    @Published var volume: Double = 50
+    @Published var muted = false
     @Published var locCity: String?
     private var lastCoord: (Double, Double)?
     private let geocoder = CLGeocoder()
@@ -335,7 +395,11 @@ final class DockStore: ObservableObject {
         keepWindowsClear = d.bool(forKey: "keepWindowsClear")
         fahrenheit = d.object(forKey: "fahrenheit") != nil ? d.bool(forKey: "fahrenheit") : Locale.current.measurementSystem == .us
         var order = d.stringArray(forKey: "tileOrder") ?? []
-        for t in TileInfo.all where !order.contains(t.id) { order.append(t.id) }
+        // New tiles go in just before the Trash.
+        for t in TileInfo.all where !order.contains(t.id) {
+            if let i = order.firstIndex(of: "trash") { order.insert(t.id, at: i) } else { order.append(t.id) }
+        }
+        note = d.string(forKey: "note") ?? ""
         tileOrder = order.filter { id in TileInfo.all.contains { $0.id == id } }
         hiddenTiles = d.stringArray(forKey: "hiddenTiles") ?? []
         userScale = d.object(forKey: "scale") != nil ? d.double(forKey: "scale") : 1
@@ -356,6 +420,8 @@ final class DockStore: ObservableObject {
         timers.append(Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.tick() })
         timers.append(Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refreshEvents() })
         timers.append(Timer.scheduledTimer(withTimeInterval: 900, repeats: true) { [weak self] _ in self?.refreshWeather() })
+        refreshUsage()
+        timers.append(Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in self?.refreshUsage() })
     }
 
     private func tick() {
@@ -366,7 +432,130 @@ final class DockStore: ObservableObject {
         refreshRunning()
         refreshBadges()
         refreshMusic()
+        checkPomodoro()
+        checkClipboard()
     }
+
+    // MARK: Claude usage (read from Claude Code's session logs in ~/.claude/projects)
+
+    func refreshUsage() {
+        guard !DockStore.demo, !hiddenTiles.contains("claude") else { return }
+        usageQueue.async { [weak self] in
+            guard let self else { return }
+            let fm = FileManager.default
+            let root = fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+            let weekAgo = Date().addingTimeInterval(-7 * 86400)
+            let midnight = Calendar.current.startOfDay(for: Date())
+            let iso = ISO8601DateFormatter()
+            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let marker = Data("\"usage\"".utf8)
+            var seen: [String: (stamp: Date, rows: [String: UsageRow])] = [:]
+
+            let walker = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])
+            while let url = walker?.nextObject() as? URL {
+                guard url.pathExtension == "jsonl",
+                      let stamp = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+                      stamp >= weekAgo else { continue }
+                if let old = self.usageFiles[url.path], old.stamp == stamp { seen[url.path] = old; continue }
+                guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { continue }
+                var rows: [String: UsageRow] = [:]
+                for line in data.split(separator: 0x0A) where line.range(of: marker) != nil {
+                    guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                          let msg = obj["message"] as? [String: Any],
+                          let u = msg["usage"] as? [String: Any],
+                          let when = (obj["timestamp"] as? String).flatMap({ iso.date(from: $0) }) else { continue }
+                    // One reply can be logged on several lines; the id keeps it from being counted twice.
+                    let id = (msg["id"] as? String ?? "") + (obj["requestId"] as? String ?? (obj["uuid"] as? String ?? ""))
+                    rows[id] = UsageRow(date: when,
+                                        input: u["input_tokens"] as? Int ?? 0,
+                                        output: u["output_tokens"] as? Int ?? 0,
+                                        cacheWrite: u["cache_creation_input_tokens"] as? Int ?? 0,
+                                        cacheRead: u["cache_read_input_tokens"] as? Int ?? 0)
+                }
+                seen[url.path] = (stamp, rows)
+            }
+            self.usageFiles = seen
+
+            var all: [String: UsageRow] = [:]
+            for file in seen.values { all.merge(file.rows) { a, _ in a } }
+            var today = Usage(), week = Usage()
+            for r in all.values where r.date >= weekAgo {
+                week.add(r)
+                if r.date >= midnight { today.add(r) }
+            }
+            DispatchQueue.main.async {
+                if self.usageToday != today { self.usageToday = today }
+                if self.usageWeek != week { self.usageWeek = week }
+            }
+        }
+    }
+
+    // MARK: Tools (focus timer, clipboard, sound and display)
+
+    func pomoToggle() {
+        if let end = pomoEnd {
+            pomoLeft = max(0, end.timeIntervalSinceNow)
+            pomoEnd = nil
+        } else {
+            pomoEnd = Date().addingTimeInterval(pomoLeft)
+        }
+    }
+
+    func pomoReset() {
+        pomoEnd = nil
+        pomoBreak = false
+        pomoLeft = Self.focusLength
+    }
+
+    /// When focus time runs out a break starts by itself; when the break ends the timer waits for a click.
+    private func checkPomodoro() {
+        guard let end = pomoEnd, end <= Date() else { return }
+        NSSound(named: "Glass")?.play()
+        pomoBreak.toggle()
+        pomoLeft = pomoBreak ? Self.breakLength : Self.focusLength
+        pomoEnd = pomoBreak ? Date().addingTimeInterval(pomoLeft) : nil
+    }
+
+    private func checkClipboard() {
+        guard !hiddenTiles.contains("clipboard") else { return }
+        let pb = NSPasteboard.general
+        guard pb.changeCount != clipCount else { return }
+        clipCount = pb.changeCount
+        // Password managers mark what they copy; those are never kept.
+        let secret = ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType"]
+        guard !(pb.types ?? []).contains(where: { secret.contains($0.rawValue) }),
+              let text = pb.string(forType: .string),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        clips.removeAll { $0 == text }
+        clips.insert(text, at: 0)
+        if clips.count > 12 { clips.removeLast(clips.count - 12) }
+    }
+
+    func copyClip(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    private func script(_ source: String) {
+        scriptQueue.async { NSAppleScript(source: source)?.executeAndReturnError(nil) }
+    }
+
+    func readVolume() {
+        scriptQueue.async { [weak self] in
+            let src = "set v to get volume settings\nreturn ((output volume of v) as text) & \",\" & ((output muted of v) as text)"
+            let out = NSAppleScript(source: src)?.executeAndReturnError(nil).stringValue ?? ""
+            let parts = out.components(separatedBy: ",")
+            guard parts.count == 2, let v = Double(parts[0]) else { return }
+            DispatchQueue.main.async { self?.volume = v; self?.muted = parts[1] == "true" }
+        }
+    }
+
+    func setVolume(_ v: Double) { volume = v; script("set volume output volume \(Int(v))") }
+    func setMuted(_ m: Bool) { muted = m; script("set volume output muted \(m)") }
+    func toggleDarkMode() {
+        script("tell application \"System Events\" to tell appearance preferences to set dark mode to not dark mode")
+    }
+    func sleepDisplay() { DispatchQueue.global().async { run("/usr/bin/pmset", ["displaysleepnow"]) } }
 
     // MARK: Apps and folders
 
@@ -791,10 +980,11 @@ struct VisualEffect: NSViewRepresentable {
 
 struct Tile<Content: View>: View {
     @EnvironmentObject var store: DockStore
+    var pad: CGFloat = 12
     @ViewBuilder var content: Content
     var body: some View {
         content
-            .padding(.horizontal, 12 * store.scale)
+            .padding(.horizontal, pad * store.scale)
             .frame(height: 60 * store.scale)
             .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 14 * store.scale, style: .continuous))
     }
@@ -1225,6 +1415,213 @@ struct TodoTile: View {
     }
 }
 
+// MARK: - Tool tiles
+
+/// The small icon square the tool tiles share.
+struct ToolFace: View {
+    @EnvironmentObject var store: DockStore
+    let icon: String
+    var label: String? = nil
+    var tint: Color = .primary
+    var body: some View {
+        Tile(pad: 9) {
+            VStack(spacing: 2) {
+                Image(systemName: icon)
+                    .font(.system(size: 18 * store.scale, weight: .medium))
+                    .foregroundStyle(tint)
+                if let label {
+                    Text(label)
+                        .font(.system(size: 9 * store.scale, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(minWidth: 24 * store.scale)
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+/// A tool tile that opens a small panel when clicked.
+struct ToolTile<Panel: View>: View {
+    @EnvironmentObject var store: DockStore
+    let icon: String
+    let name: String
+    var label: String? = nil
+    @ViewBuilder var panel: Panel
+    @State private var open = false
+    var body: some View {
+        ToolFace(icon: icon, label: label)
+            .onTapGesture { open.toggle() }
+            .popover(isPresented: $open, arrowEdge: .top) { panel.environmentObject(store) }
+            .help(name)
+    }
+}
+
+struct PomodoroTile: View {
+    @EnvironmentObject var store: DockStore
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+            let left = store.pomoEnd.map { max(0, $0.timeIntervalSince(ctx.date)) } ?? store.pomoLeft
+            let secs = Int(left.rounded(.up))
+            let idle = store.pomoEnd == nil && !store.pomoBreak && left == DockStore.focusLength
+            ToolFace(icon: store.pomoBreak ? "cup.and.saucer.fill" : "timer",
+                     label: idle ? nil : String(format: "%d:%02d", secs / 60, secs % 60),
+                     tint: store.pomoEnd == nil ? .primary : (store.pomoBreak ? .green : .orange))
+        }
+        .onTapGesture { store.pomoToggle() }
+        .contextMenu {
+            Button(store.pomoEnd == nil ? "Start" : "Pause") { store.pomoToggle() }
+            Button("Reset") { store.pomoReset() }
+        }
+        .help("Focus timer: 25 minutes, then a 5 minute break. Click to start or pause, right-click to reset.")
+    }
+}
+
+struct NotesPanel: View {
+    @EnvironmentObject var store: DockStore
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Notes").font(.headline)
+            TextEditor(text: $store.note)
+                .font(.body)
+                .frame(width: 280, height: 180)
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.15)))
+        }
+        .padding(14)
+    }
+}
+
+struct ClipboardPanel: View {
+    @EnvironmentObject var store: DockStore
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Clipboard").font(.headline)
+                Spacer()
+                if !store.clips.isEmpty { Button("Clear") { store.clips = [] }.buttonStyle(.link) }
+            }
+            if store.clips.isEmpty {
+                Text("Text you copy shows up here. Click one to copy it again.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(store.clips, id: \.self) { clip in
+                Button { store.copyClip(clip); dismiss() } label: {
+                    Text(clip.trimmingCharacters(in: .whitespacesAndNewlines))
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(6)
+                        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(14)
+        .frame(width: 300)
+    }
+}
+
+struct DownloadsPanel: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var files: [URL] = []
+    private static let folder = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+
+    private static func recent() -> [URL] {
+        let keys: [URLResourceKey] = [.addedToDirectoryDateKey, .contentModificationDateKey]
+        let all = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])) ?? []
+        func date(_ u: URL) -> Date {
+            let v = try? u.resourceValues(forKeys: Set(keys))
+            return v?.addedToDirectoryDate ?? v?.contentModificationDate ?? .distantPast
+        }
+        return Array(all.map { ($0, date($0)) }.sorted { $0.1 > $1.1 }.prefix(8).map(\.0))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Downloads").font(.headline).padding(.bottom, 4)
+            if files.isEmpty { Text("Nothing here.").font(.caption).foregroundStyle(.secondary) }
+            ForEach(files, id: \.self) { url in
+                Button { NSWorkspace.shared.open(url); dismiss() } label: {
+                    HStack(spacing: 8) {
+                        Image(nsImage: NSWorkspace.shared.icon(forFile: url.path)).resizable().frame(width: 20, height: 20)
+                        Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.vertical, 3)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            Divider().padding(.vertical, 4)
+            Button("Open Downloads Folder") { NSWorkspace.shared.open(Self.folder); dismiss() }.buttonStyle(.link)
+        }
+        .padding(14)
+        .frame(width: 300)
+        .onAppear { files = Self.recent() }
+    }
+}
+
+struct UsagePanel: View {
+    @EnvironmentObject var store: DockStore
+
+    private func row(_ title: String, _ u: Usage) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(title).font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("\(shortCount(u.tokens)) tokens").font(.subheadline.weight(.semibold)).monospacedDigit()
+            }
+            Text("\(shortCount(u.input)) in · \(shortCount(u.output)) out · \(shortCount(u.cacheWrite)) cache written")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("\(u.messages) replies · \(shortCount(u.cacheRead)) read from cache")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Claude Code usage").font(.headline)
+            row("Today", store.usageToday)
+            Divider()
+            row("Last 7 days", store.usageWeek)
+            Text("Counted from Claude Code's logs on this Mac. Chats in the Claude app are not included.")
+                .font(.caption2).foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(width: 280)
+        .onAppear { store.refreshUsage() }
+    }
+}
+
+struct ControlsPanel: View {
+    @EnvironmentObject var store: DockStore
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Sound and display").font(.headline)
+            HStack(spacing: 8) {
+                Button { store.setMuted(!store.muted) } label: {
+                    Image(systemName: store.muted ? "speaker.slash.fill" : "speaker.wave.2.fill").frame(width: 22)
+                }
+                .buttonStyle(.plain)
+                .help(store.muted ? "Unmute" : "Mute")
+                Slider(value: $store.volume, in: 0...100) { editing in
+                    if !editing { store.setVolume(store.volume) }
+                }
+            }
+            HStack {
+                Button("Light / Dark") { store.toggleDarkMode() }
+                Button("Sleep Display") { store.sleepDisplay() }
+            }
+        }
+        .padding(14)
+        .frame(width: 260)
+        .onAppear { store.readVolume() }
+    }
+}
+
 struct DockView: View {
     @EnvironmentObject var store: DockStore
 
@@ -1237,6 +1634,17 @@ struct DockView: View {
         case "stats": StatsTile()
         case "music": if let t = store.track { MusicTile(track: t) }
         case "todos": TodoTile()
+        case "pomodoro": PomodoroTile()
+        case "notes": ToolTile(icon: "note.text", name: "Notes") { NotesPanel() }
+        case "clipboard": ToolTile(icon: "doc.on.clipboard", name: "Clipboard history") { ClipboardPanel() }
+        case "screenshot":
+            ToolFace(icon: "camera.viewfinder")
+                .onTapGesture { NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Screenshot.app")) }
+                .help("Take a screenshot")
+        case "downloads": ToolTile(icon: "arrow.down.circle", name: "Downloads") { DownloadsPanel() }
+        case "controls": ToolTile(icon: "slider.horizontal.3", name: "Sound and display") { ControlsPanel() }
+        case "claude":
+            ToolTile(icon: "sparkles", name: "Claude Code tokens used today", label: shortCount(store.usageToday.tokens)) { UsagePanel() }
         case "trash": TrashIcon()
         default: EmptyView()
         }
@@ -1558,6 +1966,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 @main
 enum Main {
     @MainActor static func main() {
+        // `WidgetDock --usage` prints the Claude Code token counts the usage tile shows, then exits.
+        if CommandLine.arguments.contains("--usage") {
+            let store = DockStore.shared
+            store.refreshUsage()
+            let giveUp = Date().addingTimeInterval(30)
+            while store.usageWeek.messages == 0 && Date() < giveUp { RunLoop.main.run(until: Date().addingTimeInterval(0.2)) }
+            for (name, u) in [("today", store.usageToday), ("7 days", store.usageWeek)] {
+                print("\(name): \(u.tokens) tokens (\(u.input) in, \(u.output) out, \(u.cacheWrite) cache written, \(u.cacheRead) cache read), \(u.messages) replies")
+            }
+            exit(0)
+        }
         // `WidgetDock --screenshot out.png` draws a sample dock (made-up data) to an image and exits.
         if let i = CommandLine.arguments.firstIndex(of: "--screenshot"), i + 1 < CommandLine.arguments.count {
             DockStore.demo = true
