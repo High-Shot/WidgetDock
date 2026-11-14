@@ -334,6 +334,7 @@ final class DockStore: ObservableObject {
     @Published var pomoEnd: Date?
     @Published var pomoLeft: TimeInterval = DockStore.focusLength
     @Published var pomoBreak = false
+    private var pomoTimer: Timer?
     @Published var usageToday = Usage()
     @Published var usageWeek = Usage()
     private let usageQueue = DispatchQueue(label: "widgetdock.usage", qos: .utility)
@@ -441,36 +442,74 @@ final class DockStore: ObservableObject {
 
     var visibleTiles: [String] { tileOrder.filter { !hiddenTiles.contains($0) } }
 
+    /// How often the slow checks run. Anything that has to feel instant is driven by a system event instead.
+    static let sweep: TimeInterval = 15 * 60
+
     func start() {
-        tick()
+        refreshStats()
+        refreshRunning()
+        refreshBadges()
+        refreshMusic()
         refreshWeather()
+        refreshUsage()
         if !hiddenTiles.contains("calendar") { startCalendar() }
         if replaceDock { applySystemDock(hidden: true) }
-        timers.append(Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.tick() })
-        timers.append(Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refreshEvents() })
-        timers.append(Timer.scheduledTimer(withTimeInterval: 900, repeats: true) { [weak self] _ in self?.refreshWeather() })
-        // Timers pause while the Mac sleeps, so catch up as soon as it wakes.
-        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.refreshWeather()
-            self?.refreshEvents()
-            self?.refreshUsage()
+
+        func every(_ seconds: TimeInterval, _ work: @escaping () -> Void) {
+            let t = Timer.scheduledTimer(withTimeInterval: seconds, repeats: true) { _ in work() }
+            t.tolerance = seconds / 10   // lets macOS line wake-ups up with other work
+            timers.append(t)
         }
-        refreshUsage()
-        timers.append(Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in self?.refreshUsage() })
+        // Every 15 minutes: everything, as a safety net for the events below.
+        every(Self.sweep) { [weak self] in self?.refreshAll() }
+        // The two things macOS gives no event for. Each is a tiny check.
+        every(3) { [weak self] in self?.checkClipboard() }
+        every(30) { [weak self] in self?.refreshBadges() }
+
+        // Events: apps opening, closing and coming to the front.
+        let ws = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification,
+                     NSWorkspace.didActivateApplicationNotification] {
+            ws.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.refreshRunning()
+                self?.refreshBadges()
+                self?.refreshMusic()
+            }
+        }
+        // Timers pause while the Mac sleeps, so catch up as soon as it wakes.
+        ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in self?.refreshAll() }
+        // Spotify and Music announce every play, pause and track change.
+        for name in ["com.spotify.client.PlaybackStateChanged", "com.apple.Music.playerInfo"] {
+            DistributedNotificationCenter.default().addObserver(forName: Notification.Name(name), object: nil, queue: .main) { [weak self] _ in
+                self?.refreshMusic()
+            }
+        }
+        // Plugging in, unplugging and each battery percent.
+        let power = IOPSNotificationCreateRunLoopSource({ _ in
+            DispatchQueue.main.async { DockStore.shared.readBattery() }
+        }, nil).takeRetainedValue()
+        CFRunLoopAddSource(CFRunLoopGetMain(), power, .defaultMode)
     }
 
-    private func tick() {
+    func refreshAll() {
+        refreshStats()
+        refreshRunning()
+        refreshBadges()
+        refreshMusic()
+        refreshWeather()
+        refreshEvents()
+        refreshUsage()
+    }
+
+    /// CPU, memory, temperature and battery. Also runs when the pointer moves onto the stats tile,
+    /// so the numbers are fresh whenever they are being looked at.
+    func refreshStats() {
         cpu = readCPU()
         mem = readMemory()
         readBattery()
         cpuTemp = sensors.cpuTemp()
         let heat = ProcessInfo.processInfo.thermalState
         if heat != thermal { thermal = heat }
-        refreshRunning()
-        refreshBadges()
-        refreshMusic()
-        checkPomodoro()
-        checkClipboard()
     }
 
     // MARK: Claude usage (read from Claude Code's session logs in ~/.claude/projects)
@@ -545,12 +584,24 @@ final class DockStore: ObservableObject {
         } else {
             pomoEnd = Date().addingTimeInterval(pomoLeft)
         }
+        schedulePomodoro()
+    }
+
+    /// One timer set for the moment the focus time or break ends; nothing runs while it is idle.
+    private func schedulePomodoro() {
+        pomoTimer?.invalidate()
+        pomoTimer = nil
+        guard let end = pomoEnd, !DockStore.demo else { return }
+        pomoTimer = Timer.scheduledTimer(withTimeInterval: max(0.1, end.timeIntervalSinceNow + 0.1), repeats: false) { [weak self] _ in
+            self?.checkPomodoro()
+        }
     }
 
     func pomoReset() {
         pomoEnd = nil
         pomoBreak = false
         pomoLeft = Self.focusLength
+        schedulePomodoro()
     }
 
     /// When focus time runs out a break starts by itself; when the break ends the timer waits for a click.
@@ -560,6 +611,7 @@ final class DockStore: ObservableObject {
         pomoBreak.toggle()
         pomoLeft = pomoBreak ? Self.breakLength : Self.focusLength
         pomoEnd = pomoBreak ? now.addingTimeInterval(pomoLeft) : nil
+        schedulePomodoro()
     }
 
     private func checkClipboard() {
@@ -881,7 +933,7 @@ final class DockStore: ObservableObject {
         return min(1, pages * Double(vm_kernel_page_size) / Double(ProcessInfo.processInfo.physicalMemory))
     }
 
-    private func readBattery() {
+    func readBattery() {
         let snap = IOPSCopyPowerSourcesInfo().takeRetainedValue()
         let list = IOPSCopyPowerSourcesList(snap).takeRetainedValue() as [CFTypeRef]
         for ps in list {
@@ -1129,7 +1181,7 @@ struct Tile<Content: View>: View {
 struct ClockTile: View {
     @EnvironmentObject var store: DockStore
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+        TimelineView(.everyMinute) { ctx in
             Tile {
                 VStack(alignment: .leading, spacing: 2 * store.scale) {
                     Text(ctx.date, format: .dateTime.hour().minute())
@@ -1199,7 +1251,7 @@ struct CalendarTile: View {
     }
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 30)) { ctx in
+        TimelineView(.everyMinute) { ctx in
             let e = store.nextEvent
             let soon = e.map { $0.start.timeIntervalSince(ctx.date) < 15 * 60 } ?? false
             let canJoin = soon && e?.joinURL != nil
@@ -1469,6 +1521,8 @@ struct StatsTile: View {
                 }
             }
         }
+        .onHover { if $0 { store.refreshStats() } }
+        .help("Updates every 15 minutes, and whenever the pointer is on it")
     }
 }
 
@@ -1620,7 +1674,8 @@ struct ToolTile<Panel: View>: View {
 struct PomodoroTile: View {
     @EnvironmentObject var store: DockStore
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+        // Redraws each second only while the timer is running.
+        TimelineView(.periodic(from: .now, by: store.pomoEnd == nil ? 3600 : 1)) { ctx in
             let left = store.pomoEnd.map { max(0, $0.timeIntervalSince(ctx.date)) } ?? store.pomoLeft
             let secs = Int(left.rounded(.up))
             let idle = store.pomoEnd == nil && !store.pomoBreak && left == DockStore.focusLength
@@ -2081,6 +2136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var panels: [DockPanel] = []
     var settingsWindow: NSWindow?
     private var displayWatch: AnyCancellable?
+    private var dockWatch: AnyCancellable?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // The bar is no longer draggable (dragging now reorders apps), so drop any old saved position.
@@ -2094,12 +2150,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         displayWatch = store.$allDisplays.dropFirst().sink { [weak self] _ in
             DispatchQueue.main.async { self?.rebuildPanels() }
         }
-        // The usable screen area changes when the system Dock hides or shows.
-        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.place() }
-        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            guard let self, self.store.keepWindowsClear else { return }
-            self.fitWindows(all: false)
+        // The usable screen area changes when the system Dock hides or shows: check shortly after launch,
+        // after that setting is switched, and in the 15 minute sweep.
+        let settle = { [weak self] in
+            for delay in [2.0, 6.0] { DispatchQueue.main.asyncAfter(deadline: .now() + delay) { self?.place() } }
         }
+        settle()
+        dockWatch = store.$replaceDock.dropFirst().sink { _ in settle() }
+        // Windows are checked when you switch apps, which is when one usually lands behind the bar.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            for delay in [0.3, 1.5] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    guard let self, self.store.keepWindowsClear else { return }
+                    self.fitWindows(all: false)
+                }
+            }
+        }
+        let sweep = Timer.scheduledTimer(withTimeInterval: DockStore.sweep, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.place()
+            if self.store.keepWindowsClear { self.fitWindows(all: false) }
+        }
+        sweep.tolerance = 60
 
         store.start()
     }
