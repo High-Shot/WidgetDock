@@ -361,7 +361,16 @@ final class DockStore: ObservableObject {
     /// Moving other apps' windows needs the Accessibility permission; this shows the macOS prompt if it's missing.
     @discardableResult
     static func askForWindowControl() -> Bool {
-        AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+        let ok = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+        noteWindowControl(ok)
+        return ok
+    }
+
+    /// Records whether macOS currently lets WidgetDock control windows, so a permission problem can be
+    /// checked from Terminal (`defaults read local.widgetdock windowControl`) without guessing.
+    static func noteWindowControl(_ ok: Bool? = nil) {
+        let value = ok ?? AXIsProcessTrusted()
+        UserDefaults.standard.set("\(value ? "allowed" : "not allowed") at \(Date().formatted(date: .abbreviated, time: .standard))", forKey: "windowControl")
     }
 
     // Live data
@@ -656,6 +665,19 @@ final class DockStore: ObservableObject {
     func toggleDarkMode() {
         script("tell application \"System Events\" to tell appearance preferences to set dark mode to not dark mode")
     }
+    /// Asks first, like the system Dock, then has Finder empty the Trash.
+    func emptyTrash() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Are you sure you want to permanently erase the items in the Trash?"
+        alert.informativeText = "You can't undo this action."
+        alert.addButton(withTitle: "Empty Trash")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        script("tell application \"Finder\" to empty trash")
+    }
+
     func sleepDisplay() { DispatchQueue.global().async { run("/usr/bin/pmset", ["displaysleepnow"]) } }
 
     // MARK: Apps and folders
@@ -1471,6 +1493,11 @@ struct TrashIcon: View {
         .onHover { hover = $0 }
         .onTapGesture { NSWorkspace.shared.open(trash) }
         .help("Trash")
+        .contextMenu {
+            Button("Open") { NSWorkspace.shared.open(trash) }
+            Divider()
+            Button("Empty Trash") { store.emptyTrash() }
+        }
     }
 }
 
@@ -2174,6 +2201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sweep.tolerance = 60
 
         store.start()
+        DockStore.noteWindowControl()
     }
 
     /// Opening WidgetDock again from Applications brings up Settings.
